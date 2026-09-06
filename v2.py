@@ -19,6 +19,7 @@ VALIDATION_SPLIT = 0.9
 MAX_ITER=10000
 EVAL_ITERS=200
 n_embed = 32  # Size of the embedding vector for each token.
+dropout = 0.2  # Dropout rate.
 
 # Train a SentencePiece tokenizer.
 spm.SentencePieceTrainer.train(
@@ -77,6 +78,7 @@ class Head(nn.Module):
         self.query = nn.Linear(n_embed, head_size, bias=False)
         self.value = nn.Linear(n_embed, head_size, bias=False)
         self.register_buffer("tril", torch.tril(torch.ones(BLOCK_SIZE, BLOCK_SIZE)))
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -85,6 +87,7 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2, -1) * C**-0.5  # (B,T,T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
         wei = F.softmax(wei, dim=-1)  # (B,T,T)
+        wei= self.dropout(wei)
         v = self.value(x)  # (B,T,C)
         out = wei @ v  # (B,T,C)
         return out
@@ -96,6 +99,7 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
         self.proj = nn.Linear(num_heads * head_size, n_embed)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
@@ -111,6 +115,7 @@ class FeedForward(nn.Module):
             nn.Linear(n_embed, 4 * n_embed),
             nn.ReLU(),
             nn.Linear(4 * n_embed, n_embed),
+            nn.Dropout(dropout)
         )
 
     def forward(self, x):
@@ -140,7 +145,7 @@ class BigramLanguageModel(nn.Module):
         self.lm_head=nn.Linear(n_embed, vocab_size)
         self.sa_heads=MultiHeadAttention(num_heads=4, head_size=n_embed//4) #four heads of self attention
         self.ffn=FeedForward(n_embed) #feed forward network
-        self.blocks=nn.Sequential(*[Block(n_embed, num_heads=4) for _ in range(4)]) #stack of 4 transformer blocks
+        self.blocks=nn.Sequential(*[Block(n_embed, num_heads=4) for _ in range(4)], layer_norm=nn.LayerNorm(n_embed)) #stack of 4 transformer blocks
 
     def forward(self, idx, targets=None):
         B,T=idx.shape
