@@ -1,4 +1,4 @@
-# attention-is-all-i-need
+# Attention is All I Need
 
 This is a small, deliberately hands-on language-model project.
 
