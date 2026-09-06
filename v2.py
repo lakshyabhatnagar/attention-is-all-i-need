@@ -115,6 +115,22 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+class Block(nn.Module):
+    """Transformer block: communication followed by computation."""
+
+    def __init__(self, n_embed, num_heads):
+        super().__init__()
+        head_size = n_embed // num_heads
+        self.sa_heads = MultiHeadAttention(num_heads, head_size)
+        self.ffn = FeedForward(n_embed)
+        self.ln1 = nn.LayerNorm(n_embed)
+        self.ln2 = nn.LayerNorm(n_embed)
+
+    def forward(self, x):
+        x = x + self.sa_heads(self.ln1(x))
+        x = x + self.ffn(self.ln2(x))
+        return x
     
 class BigramLanguageModel(nn.Module):
     def __init__(self, vocab_size):
@@ -124,6 +140,7 @@ class BigramLanguageModel(nn.Module):
         self.lm_head=nn.Linear(n_embed, vocab_size)
         self.sa_heads=MultiHeadAttention(num_heads=4, head_size=n_embed//4) #four heads of self attention
         self.ffn=FeedForward(n_embed) #feed forward network
+        self.blocks=nn.Sequential(*[Block(n_embed, num_heads=4) for _ in range(4)]) #stack of 4 transformer blocks
 
     def forward(self, idx, targets=None):
         B,T=idx.shape
@@ -132,6 +149,7 @@ class BigramLanguageModel(nn.Module):
         x=token_embeddings+position_embeddings #(B,T,vocab_size)
         x=self.sa_heads(x) #apply self attention
         x=self.ffn(x) #apply feed forward network
+        x=self.blocks(x) #apply transformer blocks
         logits = self.lm_head(x)
         if targets is None:
             loss = None
