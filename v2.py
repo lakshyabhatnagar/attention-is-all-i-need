@@ -11,15 +11,19 @@ MODEL_FILE = "m.model"
 VOCAB_SIZE = 1000
 SEED = 1337
 BATCH_SIZE = 32
-BLOCK_SIZE = 8
-LEARNING_RATE = 1e-3
+BLOCK_SIZE = 64
+LEARNING_RATE = 3e-4
 MAX_NEW_TOKENS = 600
 TRAIN_SPLIT = 0.8
 VALIDATION_SPLIT = 0.9
-MAX_ITER=10000
-EVAL_ITERS=200
-n_embed = 32  # Size of the embedding vector for each token.
-dropout = 0.2  # Dropout rate.
+MAX_ITER = 20000
+EVAL_ITERS = 100
+EVAL_INTERVAL = 1000
+N_EMBED = 32
+NUM_HEADS = 4
+NUM_BLOCKS = 4
+FFN_MULTIPLIER = 4
+DROPOUT = 0.1
 
 # Train a SentencePiece tokenizer.
 spm.SentencePieceTrainer.train(
@@ -69,16 +73,17 @@ def estimate_loss():
     model.train()
     return out
 
+
 class Head(nn.Module):
     """One head of self-attention."""
 
     def __init__(self, head_size):
         super().__init__()
-        self.key = nn.Linear(n_embed, head_size, bias=False)
-        self.query = nn.Linear(n_embed, head_size, bias=False)
-        self.value = nn.Linear(n_embed, head_size, bias=False)
+        self.key = nn.Linear(N_EMBED, head_size, bias=False)
+        self.query = nn.Linear(N_EMBED, head_size, bias=False)
+        self.value = nn.Linear(N_EMBED, head_size, bias=False)
         self.register_buffer("tril", torch.tril(torch.ones(BLOCK_SIZE, BLOCK_SIZE)))
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(DROPOUT)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -98,8 +103,7 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(num_heads * head_size, n_embed)
-        self.dropout = nn.Dropout(dropout)
+        self.proj = nn.Linear(num_heads * head_size, N_EMBED)
 
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
@@ -109,13 +113,13 @@ class MultiHeadAttention(nn.Module):
 class FeedForward(nn.Module):
     """A simple linear layer followed by a non-linearity."""
 
-    def __init__(self, n_embed):
+    def __init__(self, embed_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embed, 4 * n_embed),
+            nn.Linear(embed_dim, FFN_MULTIPLIER * embed_dim),
             nn.ReLU(),
-            nn.Linear(4 * n_embed, n_embed),
-            nn.Dropout(dropout)
+            nn.Linear(FFN_MULTIPLIER * embed_dim, embed_dim),
+            nn.Dropout(DROPOUT),
         )
 
     def forward(self, x):
@@ -124,37 +128,45 @@ class FeedForward(nn.Module):
 class Block(nn.Module):
     """Transformer block: communication followed by computation."""
 
-    def __init__(self, n_embed, num_heads):
+    def __init__(self, embed_dim, num_heads):
         super().__init__()
-        head_size = n_embed // num_heads
+        head_size = embed_dim // num_heads
         self.sa_heads = MultiHeadAttention(num_heads, head_size)
-        self.ffn = FeedForward(n_embed)
-        self.ln1 = nn.LayerNorm(n_embed)
-        self.ln2 = nn.LayerNorm(n_embed)
+        self.ffn = FeedForward(embed_dim)
+        self.ln1 = nn.LayerNorm(embed_dim)
+        self.ln2 = nn.LayerNorm(embed_dim)
 
     def forward(self, x):
         x = x + self.sa_heads(self.ln1(x))
         x = x + self.ffn(self.ln2(x))
         return x
-    
+
+
 class BigramLanguageModel(nn.Module):
     def __init__(self, vocab_size):
         super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
-        self.positional_embedding_table = nn.Embedding(BLOCK_SIZE, n_embed)
-        self.lm_head=nn.Linear(n_embed, vocab_size)
-        self.sa_heads=MultiHeadAttention(num_heads=4, head_size=n_embed//4) #four heads of self attention
-        self.ffn=FeedForward(n_embed) #feed forward network
-        self.blocks=nn.Sequential(*[Block(n_embed, num_heads=4) for _ in range(4)], layer_norm=nn.LayerNorm(n_embed)) #stack of 4 transformer blocks
+        self.token_embedding_table = nn.Embedding(vocab_size, N_EMBED)
+        self.positional_embedding_table = nn.Embedding(BLOCK_SIZE, N_EMBED)
+        self.lm_head = nn.Linear(N_EMBED, vocab_size)
+        self.sa_heads = MultiHeadAttention(
+            num_heads=NUM_HEADS,
+            head_size=N_EMBED // NUM_HEADS,
+        )
+        self.ffn = FeedForward(N_EMBED)
+        self.blocks = nn.Sequential(
+            *[Block(N_EMBED, num_heads=NUM_HEADS) for _ in range(NUM_BLOCKS)]
+        )
 
     def forward(self, idx, targets=None):
-        B,T=idx.shape
-        token_embeddings=self.token_embedding_table(idx) #(B,T,C)
-        position_embeddings=self.positional_embedding_table(torch.arange(T, device=idx.device)) #(T,C)
-        x=token_embeddings+position_embeddings #(B,T,vocab_size)
-        x=self.sa_heads(x) #apply self attention
-        x=self.ffn(x) #apply feed forward network
-        x=self.blocks(x) #apply transformer blocks
+        batch, time = idx.shape
+        token_embeddings = self.token_embedding_table(idx)
+        position_embeddings = self.positional_embedding_table(
+            torch.arange(time, device=idx.device)
+        )
+        x = token_embeddings + position_embeddings
+        x = self.sa_heads(x)
+        x = self.ffn(x)
+        x = self.blocks(x)
         logits = self.lm_head(x)
         if targets is None:
             loss = None
@@ -168,7 +180,7 @@ class BigramLanguageModel(nn.Module):
     def generate(self, idx, max_new_tokens):
         # idx is a (B, T) array of token indices in the current context.
         for _ in range(max_new_tokens):
-            idx_cond=idx[:, -BLOCK_SIZE:] # crop idx to the last BLOCK_SIZE tokens
+            idx_cond = idx[:, -BLOCK_SIZE:]
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :]  # Focus on the last time step.
             probs = F.softmax(logits, dim=-1)
@@ -181,11 +193,13 @@ model = BigramLanguageModel(vocab_size=sp.get_piece_size())
 optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
 
-
-for iter in range(MAX_ITER):
-    if iter % 1000 == 0:
+for iteration in range(MAX_ITER):
+    if iteration % EVAL_INTERVAL == 0:
         losses = estimate_loss()
-        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(
+            f"step {iteration}: train loss {losses['train']:.4f}, "
+            f"val loss {losses['val']:.4f}"
+        )
     xb, yb = get_batch("train")
     logits, loss = model(xb, yb)
     optimizer.zero_grad(set_to_none=True)
